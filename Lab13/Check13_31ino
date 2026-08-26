@@ -1,0 +1,65 @@
+//13.1
+
+#include <avr/io.h>           // เรียกใช้คลังโปรแกรม io.h
+#include <avr/interrupt.h>    // เรียกใช้คลังโปรแกรมสำหรับขัดจังหวะ
+#include "my_twi.h"           // เรียกใช้คลังโปรแกรมจัดการมอดูล TWI
+#include "my_pcf8574.h"       // เรียกใช้คลังโปรแกรมจัดการไอซี PCF8574
+
+uint8_t count;                // ตัวแปรเก็บค่านับ (0-127)
+unsigned long last_time; //เก็บเวลา
+
+uint8_t prepare_data(uint8_t d)
+{
+  uint8_t tmp;
+  tmp = ~d;                   // กลับทุกบิตเป็นตรงข้ามเนื่องจาก LED เป็น Common Anode
+  tmp |= 0x80;                // กำหนดให้ MSB (บิตที่ 7) เป็น 1 เพื่อใช้เป็น Input สวิตช์
+  return tmp;
+}
+
+void setup()
+{
+  last_time = 0;  
+  Serial.begin(38400);
+  init_twi_module();          // สั่งให้มอดูล TWI เริ่มทำงาน
+                              //SDA Data 8 bit
+                              //SCL นาฬิกาควบคุมจังหวะการรับ-ส่ง
+  count = 0;                  // สั่งให้ตัวแปร count มีค่าเริ่มต้นเท่ากับ 0
+  
+  // ส่งค่าเริ่มต้น (0) ไปแสดงผลที่ LED
+  PCF8574_write(0, prepare_data(count));
+}
+
+void loop()
+{
+  uint8_t tmp;
+
+  tmp = PCF8574_read(0);
+  tmp &= 0x80;                // เช็คการกดสวิตช์ SW1 (ขาลอง MSB/P7)
+  
+  if(!tmp)                    // พบการกด (Active Low)
+  {
+    if(millis() - last_time > 20) // Debounce ป้องกันการเด้งของสัญญาณสวิตช์
+    {
+      last_time = millis(); 
+      tmp = PCF8574_read(0);
+      tmp &= 0x80; //10000000
+      
+      if (!tmp)
+      {
+        Serial.println("Keypressed detected");
+        
+        // ส่วนที่เพิ่ม
+        count = (count + 1) % 128;             // เพิ่มค่านับทีละ 1 (เมื่อถึง 127 จะวนกลับเป็น 0)
+        PCF8574_write(0, prepare_data(count)); // ส่งค่าที่นับได้ไปแสดงผลที่ LED
+      }
+      
+      // รอจนกว่าผู้ใช้จะปล่อยสวิตช์ เพื่อป้องกันการนับซ้ำจากการกดค้าง
+      do
+      {
+        tmp = PCF8574_read(0);  
+        tmp &= 0x80;
+      }
+      while(!tmp);    
+    }
+  }
+}
