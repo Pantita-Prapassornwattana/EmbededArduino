@@ -1,16 +1,8 @@
-//bonus
-/* ==========================================================================
-   240-319  Lab 15 : Sleep modes of ATmega328P
-   Checkpoint 4 : วงจรนับถอยหลัง/นับเดินหน้า 12 วินาที สลับโหมดได้ด้วย S1
-                  ตื่นจากภาวะหลับด้วย Watchdog Timer (TM1638) [Fast Polling]
-   ========================================================================== */
-
 #include <avr/sleep.h>
-#include <avr/power.h>
 #include <avr/interrupt.h>
-#include <avr/wdt.h>
+#include "my_wdt.h"
 
-// --- ขาเชื่อมต่อ TM1638 (STB->A0, CLK->A1, DIO->A2) ---
+// --- ขาเชื่อมต่อ TM1638 (ตามรูปที่ 15.3 ที่ต่อจริง — ใช้ขา Analog) ---
 const uint8_t STROBE = A0;
 const uint8_t CLOCK  = A1;
 const uint8_t DATA   = A2;
@@ -18,44 +10,16 @@ const uint8_t DATA   = A2;
 const uint8_t digitToSegment[] = {
   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
 };
-const uint8_t SEG_DASH  = 0x40; // '-'
-const uint8_t SEG_D     = 0x5E; // 'd'
-const uint8_t SEG_N     = 0x54; // 'n'
-const uint8_t SEG_U     = 0x1C; // 'u'
-const uint8_t SEG_P     = 0x73; // 'P'
+const uint8_t SEG_DASH  = 0x40; // 'g'          -> '-'
+const uint8_t SEG_D     = 0x5E; // b,c,d,e,g    -> 'd'
+const uint8_t SEG_N     = 0x54; // c,e,g        -> 'n'
+const uint8_t SEG_U     = 0x1C; // c,d,e        -> 'u'
+const uint8_t SEG_P     = 0x73; // a,b,e,f,g    -> 'P'
 const uint8_t SEG_BLANK = 0x00;
 
 const uint16_t COUNT_MAX = 1200; // 12.00 วินาที (หน่วย 1/100 วินาที)
 
-// --- ฟังก์ชันการทำงานของ Watchdog Timer ---
-
-// เผื่อใช้ที่อื่นคงเดิมไว้
-void WDT_interrupt_enable_4sec() {
-  cli();
-  MCUSR &= ~(1 << WDRF);
-  WDTCSR |= (1 << WDCE) | (1 << WDE);
-  WDTCSR = (1 << WDIE) | (1 << WDP3);
-  sei();
-}
-
-// แบบ Fast Polling (~125ms) สำหรับสแกนปุ่มกดอย่างรวดเร็ว
-void WDT_interrupt_enable_fast() {
-  cli();
-  MCUSR &= ~(1 << WDRF);                       // เคลียร์ Reset Flag
-  WDTCSR |= (1 << WDCE) | (1 << WDE);          // เปิดโหมดเปลี่ยนค่า WDT
-  WDTCSR = (1 << WDIE) | (1 << WDP1) | (1 << WDP0); // Interrupt Mode + Timeout ~125ms
-  sei();
-}
-
-void WDT_disable_custom() {
-  cli();
-  MCUSR &= ~(1 << WDRF);
-  WDTCSR |= (1 << WDCE) | (1 << WDE);
-  WDTCSR = 0x00;                             // ปิด WDT
-  sei();
-}
-
-// --- ฟังก์ชันสื่อสารกับ TM1638 (Bit-bang SPI) ---
+// --- ฟังก์ชันสื่อสารกับ TM1638 (bit-bang เหมือน Lab 11 / Checkpoint 3) ---
 void sendCommand(uint8_t value) {
   digitalWrite(STROBE, LOW);
   shiftOut(DATA, CLOCK, LSBFIRST, value);
@@ -96,22 +60,24 @@ uint8_t readButtons() {
   return buttons;
 }
 
-// --- ตัวแปรควบคุมสถานะ ---
+// --- สถานะการทำงาน ---
 enum Mode  { MODE_DOWN, MODE_UP };
 enum State { ST_IDLE, ST_RUN, ST_BLINK };
 
 volatile Mode  mode  = MODE_DOWN;
 volatile State state = ST_IDLE;
-volatile uint16_t centi = 0;        // ค่านับปัจจุบัน (1/100 วินาที)
-volatile uint16_t idleTicks = 0;    // นับเวลา 5 วินาที (500 x 10ms)
+volatile uint16_t centi = 0;        // ค่านับปัจจุบัน หน่วย 1/100 วินาที (ใช้ตอน ST_RUN/ST_BLINK)
+volatile uint16_t idleTicks = 0;    // 10ms/tick, 500 = 5 วินาที
 volatile uint8_t  blinkPhase = 0;
 volatile uint16_t blinkTicks = 0;
 volatile bool tick10 = false;
-volatile uint8_t wdtKeys = 0;       // เก็บค่าปุ่มที่อ่านได้จาก ISR(WDT_vect)
+volatile uint8_t wdtKeys = 0;       // อ่านจาก ISR(WDT_vect) ตอนหลับ
 
 uint8_t lastButtons = 0;
-const uint8_t DEBOUNCE_TICKS = 3;
+const uint8_t DEBOUNCE_TICKS = 3; // 3 x 10ms = ~30ms (แนวทางเดียวกับ Lab 9 Checkpoint 2)
 
+// debounce แบบนับซ้ำ เหมือน Checkpoint 3 — ค่าที่อ่านได้ต้องเหมือนเดิมติดกันครบ
+// DEBOUNCE_TICKS รอบ (tick 10ms) จึงจะถือว่าเป็นสถานะจริง
 uint8_t readDebouncedButtons() {
   static uint8_t candidate = 0, count = 0, stable = 0;
   uint8_t raw = readButtons();
@@ -131,7 +97,7 @@ void setupTimer1() {
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1  = 0;
-  OCR1A  = 2499;                          // 10ms @ 16MHz / prescaler 64
+  OCR1A  = 2499;                          // 10ms @ 16MHz / prescaler64
   TCCR1B |= (1 << WGM12);
   TCCR1B |= (1 << CS11) | (1 << CS10);
   TIMSK1 |= (1 << OCIE1A);
@@ -142,20 +108,20 @@ ISR(TIMER1_COMPA_vect) {
   tick10 = true;
 }
 
-// ISR ของ WDT อ่านค่าปุ่มจาก TM1638 ทุกๆ รอบ Timeout (~125ms)
+// ทำงานทุก ~4 วินาทีขณะหลับ: แอบอ่านคีย์ TM1638 (ตัวเดียวที่ CPU ทำได้ระหว่างหลับ)
 ISR(WDT_vect) {
-  digitalWrite(STROBE, HIGH);
-  delayMicroseconds(10);
   wdtKeys = readButtons();
 }
 
 void renderDisplay() {
   uint8_t seg[8] = {SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK,
-                    SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK};
+                     SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK};
 
   uint16_t showValue;
+  bool showLabel = false;
 
   if (state == ST_IDLE) {
+    showLabel = true;
     showValue = (mode == MODE_DOWN) ? COUNT_MAX : 0;
     if (mode == MODE_DOWN) { seg[0] = SEG_D; seg[1] = SEG_N; }
     else                   { seg[0] = SEG_U; seg[1] = SEG_P; }
@@ -177,31 +143,28 @@ void renderDisplay() {
   displayAll(seg);
 }
 
-// หลับแบบ Power-Down แล้วใช้ WDT ตื่นสแกนปุ่มทุก ~125ms
+// หลับ + ตื่นทุก ~4 วิด้วย WDT เพื่อแอบดูคีย์ วนจนกว่าจะมีคนกดจริง แล้วค่อยกลับสู่ idle
 void enterSleepUntilKeyPress() {
   uint8_t off[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  displayAll(off); // ดับหน้าจอก่อนหลับ
+  displayAll(off);
 
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-
   do {
     wdtKeys = 0;
-    WDT_interrupt_enable_fast();          // ตื่นถี่ขึ้นทุก ~125ms
+    WDT_interrupt_enable(wdt_timeout_4sec); // WDIE ถูกฮาร์ดแวร์เคลียร์เองหลังทำงาน 1 ครั้ง ต้องเปิดใหม่ทุกรอบ
     sleep_enable();
     sleep_bod_disable();
-    sei();
-    sleep_cpu();                          // สั่งหลับ...
+    sleep_cpu();                            // หลับ...ตื่นทุก 4 วิ (หรือเร็วกว่านั้นถ้ามี interrupt อื่นแทรก)
     sleep_disable();
-  } while (wdtKeys == 0);                 // ถ้าไม่มีการกดปุ่ม จะกลับไปหลับต่อทันที
+  } while (wdtKeys == 0);                   // ตื่นแบบไม่มีคีย์ถูกกด -> หลับต่อ
+  WDT__disable();                            // กลับสู่การทำงานปกติแล้ว ปิด WDT กันมันไปรีเซ็ตเครื่องเอง
 
-  WDT_disable_custom();                   // ตื่นขึ้นมาแล้วปิด WDT
-
-  sendCommand(0x8F);                      // เปิดจอแสดงผล TM1638 คืนค่าความสว่าง
-  
-  lastButtons = wdtKeys;                  // กำหนดค่า Baseline ปุ่มกด
+  // ปุ่มที่ทำให้ตื่นถือเป็น "การกดเพื่อปลุก" เท่านั้น ยังไม่ใช่คำสั่ง ต้องกดใหม่อีกครั้ง
+  // (ตามที่สาธิตในคลิป) จึงเก็บสถานะปุ่มปัจจุบันไว้เป็น baseline ก่อน
+  lastButtons = wdtKeys;
   state = ST_IDLE;
   idleTicks = 0;
-  renderDisplay();                        // แสดงผลหน้าจอกลับมาปกติ
+  renderDisplay();
 }
 
 void setup() {
@@ -227,15 +190,15 @@ void loop() {
 
   switch (state) {
     case ST_IDLE:
-      if (pressed & 0x80) {               // กด S8 = เริ่มนับ
+      if (pressed & 0x80) {                 // S8 = เริ่มนับ
         state = ST_RUN;
         centi = (mode == MODE_DOWN) ? COUNT_MAX : 0;
-      } else if (pressed & 0x01) {         // กด S1 = สลับโหมด (DOWN <-> UP)
+      } else if (pressed & 0x01) {           // S1 = สลับโหมด (ทำได้เฉพาะตอน idle)
         mode = (mode == MODE_DOWN) ? MODE_UP : MODE_DOWN;
         idleTicks = 0;
       } else {
         idleTicks++;
-        if (idleTicks >= 500) {            // ไม่กดปุ่มใดๆ ครบ 5 วินาที -> หลับ
+        if (idleTicks >= 500) {              // ไม่กดปุ่มครบ 5 วินาที -> หลับ
           enterSleepUntilKeyPress();
           return;
         }
@@ -254,10 +217,10 @@ void loop() {
 
     case ST_BLINK:
       blinkTicks++;
-      if (blinkTicks >= 30) {             // ~300ms เปลี่ยนเฟสกระพริบ
+      if (blinkTicks >= 30) {                // ~300ms ต่อเฟส
         blinkTicks = 0;
         blinkPhase++;
-        if (blinkPhase >= 6) {             // กระพริบติด-ดับครบ 2 รอบ -> หลับ
+        if (blinkPhase >= 6) {               // กระพริบครบ 2 รอบ -> หลับ
           enterSleepUntilKeyPress();
           return;
         }
