@@ -1,0 +1,264 @@
+//19.1
+#include <Arduino_FreeRTOS.h>
+#include <semphr.h>          // เพิ่ม Header File สำหรับใช้งาน Semaphore / Mutex
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad_I2C.h>
+#include <Keypad.h>
+#include <TimeLib.h>
+#include <DS1307RTC.h>
+
+#define I2CADDR_KEYPAD 0x20  // กำหนด Address I2C สำหรับ Keypad
+#define YEAR_MIN       2000  // ขอบเขตปีขั้นต่ำ (ใช้อ้างอิงตอนอ่านค่าจาก RTC เท่านั้น)
+#define YEAR_MAX       2099  // ขอบเขตปีสูงสุด
+#define BLINK_MS       400   // ความเร็วในการกระพริบตัวเลข (มิลลิวินาที)
+
+// ประกาศตัวแปร Global สำหรับเก็บกุญแจ Mutex ล็อกบัส I2C
+SemaphoreHandle_t xI2CMutex;
+
+// กำหนดขนาดและแผนผังปุ่มกดของ Keypad 4x4
+const byte ROWS = 4, COLS = 4;
+char hexaKeys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {7, 6, 5, 4};
+byte colPins[COLS] = {3, 2, 1, 0};
+
+// ประกาศ Object ของ LCD และ Keypad I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Keypad_I2C keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS, I2CADDR_KEYPAD);
+
+// กำหนด Enum สำหรับโหมดการทำงานและฟิลด์ที่กำลังปรับแต่ง
+// (ตัดโหมดตั้งวันที่ออกแล้ว เหลือแค่โหมดทำงานปกติ กับโหมดตั้งเวลา)
+enum Mode  { MODE_RUN, MODE_SET_TIME };
+enum Field { F_HOUR, F_MIN };
+
+Mode  mode  = MODE_RUN;
+Field field = F_HOUR;
+
+// ตัวแปรสำหรับเก็บค่าเวลาชั่วคราวขณะแก้ไข (วันที่ไม่แก้ไขแล้ว จึงไม่ต้องมีตัวแปรชั่วคราวของวันที่)
+uint8_t e_hour = 0, e_min = 0;
+// เก็บวันที่ปัจจุบันไว้เฉย ๆ เพื่อเขียนกลับ RTC ตอนบันทึกเวลา โดยไม่เปลี่ยนแปลงวันที่เดิม
+uint8_t e_day = 1, e_mon = 1;
+int     e_year = 2026;
+tmElements_t tm;
+
+bool blink_on = true;        // สถานะเปิด/ปิด การกระพริบของตัวอักษร
+
+// ============================================================================
+// RTC DATA MANAGEMENT
+// ============================================================================
+// อ่านเวลาปัจจุบันจาก RTC ชิป DS1307 เข้าสู่ตัวแปรชั่วคราว
+void load_from_rtc(void) {
+  if (RTC.read(tm)) {
+    e_hour = tm.Hour;   e_min  = tm.Minute;
+    e_day  = tm.Day;    e_mon  = tm.Month;
+    e_year = tmYearToCalendar(tm.Year);
+  }
+}
+
+// บันทึกค่าเวลาใหม่กลับลง RTC ชิป DS1307 โดยคงวันที่เดิมไว้ (ไม่มีการแก้วันที่แล้ว)
+void save_to_rtc(void) {
+  tmElements_t w;
+  w.Hour   = e_hour;
+  w.Minute = e_min;
+  w.Second = 0;
+  w.Day    = e_day;
+  w.Month  = e_mon;
+  w.Year   = CalendarYrToTm(e_year);
+
+  time_t t = makeTime(w);
+  breakTime(t, w);
+  RTC.write(w);
+}
+
+// เพิ่มหรือลดค่าของตัวแปรตามฟิลด์ที่กำลังเลือกอยู่ (เหลือแค่ชั่วโมง/นาที)
+void adjust(int8_t step) {
+  switch (field) {
+    case F_HOUR:
+      e_hour = (uint8_t)((e_hour + 24 + step) % 24);
+      break;
+    case F_MIN:
+      e_min  = (uint8_t)((e_min + 60 + step) % 60);
+      break;
+  }
+}
+
+// ============================================================================
+// LCD HELPERS & DISPLAY
+// ============================================================================
+// ส่งข้อความไปแสดงบนบรรทัด LCD พร้อมล้างช่องว่างส่วนเกิน
+void lcd_line(uint8_t row, const char *s) {
+  char b[17];
+  uint8_t i = 0;
+  while (i < 16 && s[i]) { b[i] = s[i]; i++; }
+  while (i < 16) b[i++] = ' ';
+  b[16] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(b);
+}
+
+// จัดฟอร์แมตสตริงของวันที่ (D/M/Y) สำหรับแสดงผล (ไม่มีการกระพริบแล้วเพราะแก้วันที่ไม่ได้)
+void build_date_line(char *out, uint8_t d, uint8_t m, int y) {
+  char t[12];
+  sprintf(t, "%d/%02d/%04d", d, m, y);
+
+  uint8_t p = strlen(t);
+  uint8_t off = 16 - p;
+  memset(out, ' ', 16);
+  out[16] = '\0';
+  memcpy(out, "D/M/Y=", 6);
+  memcpy(out + off, t, p);
+}
+
+// แสดงผลเวลาและวันที่ในโหมดทำงานปกติ (MODE_RUN)
+// ตัดการสลับบรรทัดออกแล้ว: บรรทัดบนเป็นวันที่เสมอ บรรทัดล่างเป็นเวลาเสมอ
+void show_run(void) {
+  char line_date[17], line_time[17];
+
+  if (RTC.read(tm)) {
+    build_date_line(line_date, tm.Day, tm.Month, tmYearToCalendar(tm.Year));
+    sprintf(line_time, "   Time = %02d:%02d", tm.Hour, tm.Minute);
+
+    lcd_line(0, line_date);
+    lcd_line(1, line_time);
+  } else {
+    // แสดงข้อความตักเตือนหากอ่าน RTC ไม่สำเร็จ
+    lcd_line(0, "DS1307 Read Err");
+    lcd_line(1, "Check circuitry");
+  }
+}
+
+// แสดงผลหน้าจอขณะตั้งค่าเวลา พร้อมการทำตัวเลขกระพริบในฟิลด์ที่เลือก
+// บรรทัดวันที่แสดงค่าปัจจุบันเฉย ๆ (แก้ไม่ได้แล้ว)
+void show_set(void) {
+  char line_date[17], line_time[17];
+
+  build_date_line(line_date, e_day, e_mon, e_year);
+
+  sprintf(line_time, "   Time = %02d:%02d", e_hour, e_min);
+  if (!blink_on) {
+    if (field == F_HOUR) {
+      line_time[10] = ' '; line_time[11] = ' ';
+    } else {
+      line_time[13] = ' '; line_time[14] = ' ';
+    }
+  }
+
+  lcd_line(0, line_date);
+  lcd_line(1, line_time);
+}
+
+// ============================================================================
+// KEYPAD LOGIC
+// ============================================================================
+// ถอดรหัสและประมวลผลคำสั่งตามปุ่มที่กดบน Keypad
+// (ตัดปุ่ม 0 สลับบรรทัด และปุ่ม A ตั้งวันที่ออกแล้ว)
+void handle_key(char key) {
+  switch (key) {
+    // ปุ่ม B: เข้า/สลับโหมดตั้งเวลา (ชั่วโมง -> นาที)
+    case 'B':
+      if (mode != MODE_SET_TIME) {
+        load_from_rtc(); // มีการใช้ I2C ดึง RTC
+        mode  = MODE_SET_TIME;
+        field = F_HOUR;
+      } else {
+        field = (field == F_HOUR) ? F_MIN : F_HOUR;
+      }
+      blink_on = true;
+      break;
+
+    // ปุ่ม C: เพิ่มค่าตัวเลข
+    case 'C':
+      if (mode != MODE_RUN) adjust(+1);
+      break;
+
+    // ปุ่ม D: ลดค่าตัวเลข
+    case 'D':
+      if (mode != MODE_RUN) adjust(-1);
+      break;
+
+    // ปุ่ม #: ยืนยันบันทึกค่ากลับลง RTC และกลับสู่โหมดทำงานปกติ
+    case '#':
+      if (mode != MODE_RUN) {
+        save_to_rtc(); // มีการใช้ I2C บันทึก RTC
+        mode = MODE_RUN;
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ============================================================================
+// FREERTOS TASKS
+// ============================================================================
+// Task สำหรับคอยตรวจจับและสแกนการกดปุ่มจาก Keypad
+void TaskKeypad(void *pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    // ขอสิทธิ์ล็อกบัส I2C ก่อนใช้งาน Keypad/RTC
+    if (xSemaphoreTake(xI2CMutex, portMAX_DELAY) == pdTRUE) {
+      char key = keypad.getKey(); // อ่านค่าผ่าน I2C
+      if (key != NO_KEY) {
+        handle_key(key);         // ประมวลผลปุ่มกด (อาจมีอ่าน/เขียน RTC)
+      }
+      xSemaphoreGive(xI2CMutex);  // คืนสิทธิ์การใช้งานบัส I2C
+    }
+    vTaskDelay(50 / portTICK_PERIOD_MS); // พักรอ 50 ms
+  }
+}
+
+// Task สำหรับควบคุมจังหวะกระพริบและอัปเดตหน้าจอ LCD
+void TaskDisplay(void *pvParameters) {
+  (void) pvParameters;
+  TickType_t xLastBlinkTime = xTaskGetTickCount();
+
+  for (;;) {
+    // ตรวจสอบจังหวะการสลับสถานะกระพริบตัวเลข
+    if ((xTaskGetTickCount() - xLastBlinkTime) >= pdMS_TO_TICKS(BLINK_MS)) {
+      xLastBlinkTime = xTaskGetTickCount();
+      blink_on = !blink_on;
+    }
+
+    // ขอสิทธิ์ล็อกบัส I2C ก่อนอ่าน RTC และส่งค่าออกจอ LCD
+    if (xSemaphoreTake(xI2CMutex, portMAX_DELAY) == pdTRUE) {
+      if (mode == MODE_RUN) {
+        show_run();  // อ่าน RTC และเขียน LCD ผ่าน I2C
+      } else {
+        show_set();  // เขียน LCD ผ่าน I2C
+      }
+      xSemaphoreGive(xI2CMutex); // คืนสิทธิ์การใช้งานบัส I2C
+    }
+
+    vTaskDelay(150 / portTICK_PERIOD_MS); // พักรอ 150 ms
+  }
+}
+
+// ============================================================================
+// SYSTEM INITIALIZATION
+// ============================================================================
+void setup() {
+  Wire.begin();        // เริ่มต้นการสื่อสาร I2C
+
+  // สร้าง Mutex Semaphore สำหรับล็อกการใช้งานบัส I2C
+  xI2CMutex = xSemaphoreCreateMutex();
+
+  // ก่อนเข้าสู่ Scheduler สามารถใช้งาน I2C เพื่อ Setup ได้ตามปกติ
+  keypad.begin();      // เริ่มต้นระบบ Keypad
+  lcd.init();          // เริ่มต้นการทำงานของ LCD
+  lcd.backlight();     // เปิดไฟ Backlight หน้าจอ
+  lcd.clear();         // ล้างหน้าจอ
+
+  // สร้าง Task ของ FreeRTOS โดยให้ KeypadTask มี Priority สูงกว่า DisplayTask
+  xTaskCreate(TaskKeypad,  "KeypadTask",  128, NULL, 2, NULL);
+  xTaskCreate(TaskDisplay, "DisplayTask", 192, NULL, 1, NULL);
+}
+
+void loop() {
+  // ไม่ใช้งาน ปล่อยให้ FreeRTOS Scheduler จัดการ Task วนรอบอัตโนมัติ
+}
